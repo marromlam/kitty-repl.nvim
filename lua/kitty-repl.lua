@@ -10,6 +10,23 @@ local M = {}
 -- local variable with the command that is going to be executed
 local the_command
 
+-- this function is only to print lua dicts
+-- I use it for debugging purposes
+function dump(o)
+   if type(o) == 'table' then
+      local s = '{ '
+      for k,v in pairs(o) do
+         if type(k) ~= 'number' then k = '"'..k..'"' end
+         s = s .. '['..k..'] = ' .. dump(v) .. ','
+      end
+      return s .. '} '
+   else
+      return tostring(o)
+   end
+ end
+
+
+
 
 -- open runner
 local function open_new_repl()
@@ -22,16 +39,59 @@ local function open_new_repl()
 end
 
 
-local function cook_command(region)
+local function cook_command_python(region)
   local lines
+  local command
+  local last_line
   if region[1] == 0 then
+    -- we only have selected one line here
     lines = vim.api.nvim_buf_get_lines(0, vim.api.nvim_win_get_cursor(0)[1]-1, vim.api.nvim_win_get_cursor(0)[1], true)
+    command = table.concat(lines, '\n') .. '\n'
   else
+    -- we have several lines selected here
     lines = vim.api.nvim_buf_get_lines(0, region[1]-1, region[2], true)
+    last_line = lines[#lines - 0] -- lets get last_line and see if is indented or not
+    -- print(dump(lines))
+    -- print(last_line)
+    if last_line:find("  ", 1, true) == 1 then
+      -- this is an indented line, hence we add another CR in order to just run the line
+      command = table.concat(lines, '\r') .. '\r\r'
+    else
+      command = table.concat(lines, '\n') .. '\r'
+    end
   end
-  local command = table.concat(lines, '\r') .. '\r'
   return command
 end
+
+
+local function cook_command_cpp(region)
+  local lines
+  local command
+  local last_line
+  if region[1] == 0 then
+    -- we only have selected one line here
+    lines = vim.api.nvim_buf_get_lines(0, vim.api.nvim_win_get_cursor(0)[1]-1, vim.api.nvim_win_get_cursor(0)[1], true)
+    command = table.concat(lines, '\n \n') .. '\n \r'
+  else
+    -- we have several lines selected here
+    lines = vim.api.nvim_buf_get_lines(0, region[1]-1, region[2], true)
+    command = table.concat(lines, '\n') .. '\n \r'
+  end
+  return command
+end
+
+
+local function cook_command(region)
+  local command
+  if vim.bo.filetype == "py" then
+    command = cook_command_python(region)
+  else
+    command = cook_command_cpp(region)
+  end
+  return command
+end
+
+
 
 
 local function repl_send(cmd_args, command)
@@ -51,6 +111,23 @@ function M.repl_run(region)
   vim.cmd([[delm <>]]) -- delete visual selection marks
   if CMDfg.runner_open == true then
     repl_send(CMDfg.run_cmd, the_command)
+  else
+    open_new_repl()
+  end
+end
+
+
+function M.repl_start(jit_runner)
+  if CMDfg.runner_open == true then
+    if jit_runner == "auto" then
+      if vim.bo.filetype == "py" then
+        repl_send(CMDfg.run_cmd, "MPLBACKEND='module://kitty' ipython" .. "\r")
+      else
+        repl_send(CMDfg.run_cmd, "cling" .. "\r")
+      end
+    else
+      repl_send(CMDfg.run_cmd, jit_runner .. "\r")
+    end
   else
     open_new_repl()
   end
@@ -111,9 +188,7 @@ local function create_commands()
   cmd[[command! KittyREPLRun lua require('kitty-repl').repl_prompt_and_run()]]
   cmd[[command! KittyREPLClear lua require('kitty-repl').repl_cleanup()]]
   cmd[[command! KittyREPLKill lua require('kitty-repl').repl_killer()]]
-  -- move this one elsewere...
-  cmd[[command! StartIPythonConsole lua require('kitty-repl').repl_send_and_run("MPLBACKEND='module://kitty' ipython")]]
-  cmd[[command! StartClingConsole lua require('kitty-repl').repl_send_and_run("cling")]]
+  cmd[[command! KittyREPLStart lua require('kitty-repl').repl_start("auto")]]
 end
 
 
@@ -125,8 +200,7 @@ local function define_keymaps()
   nvim_set_keymap('n', '<leader>tk', ':KittyREPLKill<cr>', {})
   nvim_set_keymap('n', '<leader>tl', ':KittyREPLRunAgain<cr>', {})
   -- trigger these automatically on extension
-  nvim_set_keymap('n', '<leader>tw', ':StartIPythonConsole<cr>', {})
-  nvim_set_keymap('n', '<leader>tW', ':StartClingConsole<cr>', {})
+  nvim_set_keymap('n', '<leader>tw', ':KittyREPLStart<cr>', {})
 end
 
 
