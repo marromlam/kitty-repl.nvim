@@ -123,7 +123,7 @@ function M.repl_start(jit_runner)
       if vim.bo.filetype == "py" then
         repl_send(CMDfg.run_cmd, "MPLBACKEND='module://kitty' ipython" .. "\r")
       else
-        repl_send(CMDfg.run_cmd, "cling" .. "\r")
+        repl_send(CMDfg.run_cmd, "icpp" .. "\r")
       end
     else
       repl_send(CMDfg.run_cmd, jit_runner .. "\r")
