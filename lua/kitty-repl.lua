@@ -12,7 +12,7 @@ local the_command
 
 -- this function is only to print lua dicts
 -- I use it for debugging purposes
-function dump(o)
+local function dump(o)
    if type(o) == 'table' then
       local s = '{ '
       for k,v in pairs(o) do
@@ -25,19 +25,51 @@ function dump(o)
    end
  end
 
+--- Sleep function
+--- Lua misses a sleep function, so I made one using the shell
+--- sleep function. Be aware this function does not work on Windows
+--- @param n number of seconds to sleep
+local function sleep(n)
+  os.execute("sleep " .. tonumber(n))
+end
 
 
+local function get_largest_id(id)
+  -- local foo = io.popen[[ kitty @ ls 2>/dev/null | grep \"id\" | tr '\"id\":' ' ' | tr ',' ' ' | tail -1 | sed 's/^ *//g' ]]
+  local foo = io.popen[[ kitty @ ls | grep \"id\" | tr "\"id\":" " " | tr "," " " | tail -1 | sed 's/^ *//g' ]]
+  local bar = foo:read("*a")
+  return tonumber(id or bar)
+end
+
+function M.get_id(id)
+  return get_largest_id(id)
+end
 
 -- open runner
 local function open_new_repl()
-  loop.spawn('kitty', {
-    args = {'@',
-      'launch',                   -- launches a vertical split
-      '--title=' .. CMDfg.repl_id -- we need a random title
-  }})
+  if CMDfg.window_kind == 'attached' then
+    loop.spawn('kitty', { args = {'@', 'launch', '--title=REPL' }})
+  else
+    loop.spawn('kitty', { args = {'@', 'launch', '--title=REPL' }})
+  end
+
+  sleep(0.1)
+  -- let's hope nobody creates a new kitty window before we get to it
+  local window_id = get_largest_id(CMDfg.window_id)
+  -- now we are ready to set the basic info for the repl
+  CMDfg.run_cmd = {'send-text', '--match=id:' .. window_id}
+  CMDfg.kill_cmd = {'close-window', '--match=id:' .. window_id}
   CMDfg.runner_open = true
 end
 
+local function repl_send(cmd_args, command)
+  local args = {'@'}
+  for _, v in pairs(cmd_args) do
+    table.insert(args, v)
+  end
+  table.insert(args, command)
+  loop.spawn('kitty', { args = args })
+end
 
 local function cook_command_python(region)
   local lines
@@ -46,11 +78,11 @@ local function cook_command_python(region)
   if region[1] == 0 then
     -- we only have selected one line here
     lines = vim.api.nvim_buf_get_lines(0, vim.api.nvim_win_get_cursor(0)[1]-1, vim.api.nvim_win_get_cursor(0)[1], true)
-    command = table.concat(lines, '\n') .. '\n'
+    command = table.concat(lines, '\r') .. '\r'
   else
     -- we have several lines selected here
     lines = vim.api.nvim_buf_get_lines(0, region[1]-1, region[2], true)
-    last_line = lines[#lines - 0] -- lets get last_line and see if is indented or not
+    --[[ last_line = lines[#lines - 0] -- lets get last_line and see if is indented or not
     -- print(dump(lines))
     -- print(last_line)
     if last_line:find("  ", 1, true) == 1 then
@@ -58,10 +90,31 @@ local function cook_command_python(region)
       command = table.concat(lines, '\r') .. '\r\r'
     else
       command = table.concat(lines, '\n') .. '\r'
-    end
+    end ]]
+
+    -- lets use cpaste for now
+    repl_send(CMDfg.run_cmd, "%cpaste -q\r")
+    sleep(0.1)
+    command = table.concat(lines, '\r') .. '\r--\r'
   end
   return command
 end
+
+
+local function ORIGINAL(region)
+  local lines
+  if region[1] == 0 then
+    lines = vim.api.nvim_buf_get_lines(0, vim.api.nvim_win_get_cursor(0)[1]-1, vim.api.nvim_win_get_cursor(0)[1], true)
+  else
+    lines = vim.api.nvim_buf_get_lines(0, region[1]-1, region[2], true)
+  end
+  local command = table.concat(lines, '\r') .. '\r'
+  return command
+end
+
+
+
+
 
 
 local function cook_command_cpp(region)
@@ -71,11 +124,11 @@ local function cook_command_cpp(region)
   if region[1] == 0 then
     -- we only have selected one line here
     lines = vim.api.nvim_buf_get_lines(0, vim.api.nvim_win_get_cursor(0)[1]-1, vim.api.nvim_win_get_cursor(0)[1], true)
-    command = table.concat(lines, '\n \n') .. '\n \r'
+    command = table.concat(lines, '\r') .. '\r'
   else
     -- we have several lines selected here
     lines = vim.api.nvim_buf_get_lines(0, region[1]-1, region[2], true)
-    command = table.concat(lines, '\n') .. '\n \r'
+    command = table.concat(lines, '\r') .. '\r'
   end
   return command
 end
@@ -83,7 +136,7 @@ end
 
 local function cook_command(region)
   local command
-  if vim.bo.filetype == "py" then
+  if vim.bo.filetype == "python" then
     command = cook_command_python(region)
   else
     command = cook_command_cpp(region)
@@ -94,14 +147,6 @@ end
 
 
 
-local function repl_send(cmd_args, command)
-  local args = {'@'}
-  for _, v in pairs(cmd_args) do
-    table.insert(args, v)
-  end
-  table.insert(args, command)
-  loop.spawn('kitty', { args = args })
-end
 
 
 
@@ -116,6 +161,10 @@ function M.repl_run(region)
   end
 end
 
+function M.repl_select(id)
+  CMDfg.window_id = id or CMDfg.window_id
+  print("You have selected the following kitty window ID:", CMDfg.window_id)
+end
 
 function M.repl_start(jit_runner)
   if CMDfg.runner_open == true then
@@ -193,15 +242,19 @@ end
 
 
 local function define_keymaps()
-  nvim_set_keymap('n', '<leader>tr', ':KittyREPLRun<cr>', {})
-  nvim_set_keymap('x', '<leader>ts', ':KittyREPLSend<cr>', {})
-  nvim_set_keymap('n', '<leader>ts', ':KittyREPLSend<cr>', {})
-  nvim_set_keymap('n', '<leader>tc', ':KittyREPLClear<cr>', {})
-  nvim_set_keymap('n', '<leader>tk', ':KittyREPLKill<cr>', {})
-  nvim_set_keymap('n', '<leader>tl', ':KittyREPLRunAgain<cr>', {})
+  opts = {noremap = true, silent = true}
+  nvim_set_keymap('n', '<leader>;r', ':KittyREPLRun<cr>', opts)
+  nvim_set_keymap('x', '<leader>;s', ':KittyREPLSend<cr>', opts)
+  nvim_set_keymap('n', '<leader>;s', ':KittyREPLSend<cr>', opts)
+  nvim_set_keymap('x', '<S-CR>', ':KittyREPLSend<cr><cr>', opts)
+  nvim_set_keymap('n', '<S-CR>', ':KittyREPLSend<cr><cr>', opts)
+  nvim_set_keymap('n', '<leader>;c', ':KittyREPLClear<cr>', opts)
+  nvim_set_keymap('n', '<leader>;k', ':KittyREPLKill<cr>', opts)
+  nvim_set_keymap('n', '<leader>;l', ':KittyREPLRunAgain<cr>', opts)
   -- trigger these automatically on extension
-  nvim_set_keymap('n', '<leader>tw', ':KittyREPLStart<cr>', {})
+  nvim_set_keymap('n', '<leader>;w', ':KittyREPLStart<cr>', opts)
 end
+
 
 
 function M.setup(cfg_)
@@ -210,16 +263,20 @@ function M.setup(cfg_)
   -- TODO: All concerning repl_id could be replaced wiht the window ID
   --       in Kitty. This could be useful if we want to reuse an existing
   --       window as repl.
-  local uuid_handle = io.popen[[uuidgen|sed 's/.*/&/']]
-  local uuid = uuid_handle:read("*a")
-  uuid_handle:close()
+
+  -- get kitty largest window id
+
+  -- local wid = io.popen[[ kitty @ ls 2>/dev/null | grep \"id\" | tr '\"id\":' ' ' | tr ',' ' ' | tail -1 | sed 's/^ *//g' ]]
+  -- local uuid_handle = io.popen[[uuidgen|sed 's/.*/&/']]
+  -- local uuid = uuid_handle:read("*a")
+  -- uuid_handle:close()
 
   -- set run and kill commands to runner_id
-  CMDfg.repl_id = 'runner ' .. uuid
-  CMDfg.run_cmd = CMDfg.run_cmd or {'send-text',
-                                    '--match=title:' .. CMDfg.repl_id}
-  CMDfg.kill_cmd = CMDfg.kill_cmd or {'close-window',
-                                      '--match=title:' .. CMDfg.repl_id}
+  CMDfg.window_id = nil
+
+  -- set which kind of window will have the repl
+  -- it can be `attached` or `native`
+  CMDfg.window_kind = 'attached'
 
   -- define keymaps
   create_commands()
@@ -236,5 +293,13 @@ function M.setup(cfg_)
 
 end
 
+-- Now let's ensure not REPL is open after we exit
+vim.cmd [[
+augroup KittyREPL
+  autocmd!
+  autocmd FileType * autocmd BufDelete <buffer> KittyREPLKill
+  autocmd QuitPre *  KittyREPLKill
+augroup end
+]]
 
 return M
