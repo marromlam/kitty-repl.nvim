@@ -1,5 +1,4 @@
 local fn = vim.fn
-local fn = vim.fn
 local cmd = vim.cmd
 local loop = vim.loop
 local nvim_set_keymap = vim.api.nvim_set_keymap
@@ -64,12 +63,9 @@ end
 
 -- open runner
 local function open_new_repl()
-	if CMDfg.window_kind == "attached" then
+	if REPL.window_kind == "attached" then
 		if os.getenv("SSH_TTY") then
-			loop.spawn(
-				"kitty",
-				{ args = { "@", "--to=tcp:localhost:" .. os.getenv("KITTY_PORT"), "launch", "--title=REPL" } }
-			)
+			loop.spawn( "kitty", { args = { "@", "--to=tcp:localhost:" .. os.getenv("KITTY_PORT"), "launch", "--title=REPL" } })
 		else
 			loop.spawn("kitty", { args = { "@", "launch", "--title=REPL" } })
 		end
@@ -79,20 +75,20 @@ local function open_new_repl()
 
 	sleep(0.1)
 	-- let's hope nobody creates a new kitty window before we get to it
-	local window_id = get_largest_id(CMDfg.window_id)
+	local window_id = get_largest_id(REPL.window_id)
 	-- now we are ready to set the basic info for the repl
-	CMDfg.run_cmd = { "send-text", "--match=id:" .. window_id }
-	CMDfg.kill_cmd = { "close-window", "--match=id:" .. window_id }
+	REPL.run_cmd = { "send-text", "--match=id:" .. window_id }
+	REPL.kill_cmd = { "close-window", "--match=id:" .. window_id }
 	if os.getenv("SSH_TTY") then
-		CMDfg.run_cmd = { "--to=tcp:localhost:" .. os.getenv("KITTY_PORT"), "send-text", "--match=id:" .. window_id }
-		CMDfg.kill_cmd =
+		REPL.run_cmd = { "--to=tcp:localhost:" .. os.getenv("KITTY_PORT"), "send-text", "--match=id:" .. window_id }
+		REPL.kill_cmd =
 			{
 				"--to=tcp:localhost:" .. os.getenv("KITTY_PORT"),
 				"close-window",
 				"--match=id:" .. window_id,
 			}
 	end
-	CMDfg.runner_open = true
+	REPL.runner_open = true
 end
 
 local function repl_send(cmd_args, command)
@@ -131,7 +127,7 @@ local function cook_command_python(region)
     end ]]
 
 		-- lets use cpaste for now
-		repl_send(CMDfg.run_cmd, "%cpaste -q\r")
+		repl_send(REPL.run_cmd, "%cpaste -q\r")
 		sleep(0.1)
 		command = table.concat(lines, "\r") .. "\r--\r"
 	end
@@ -172,28 +168,28 @@ end
 function M.repl_run(region)
 	the_command = cook_command(region)
 	vim.cmd([[delm <>]]) -- delete visual selection marks
-	if CMDfg.runner_open == true then
-		repl_send(CMDfg.run_cmd, the_command)
+	if REPL.runner_open == true then
+		repl_send(REPL.run_cmd, the_command)
 	else
 		open_new_repl()
 	end
 end
 
 function M.repl_select(id)
-	CMDfg.window_id = id or CMDfg.window_id
-	print("You have selected the following kitty window ID:", CMDfg.window_id)
+	REPL.window_id = id or REPL.window_id
+	print("You have selected the following kitty window ID:", REPL.window_id)
 end
 
 function M.repl_start(jit_runner)
-	if CMDfg.runner_open == true then
+	if REPL.runner_open == true then
 		if jit_runner == "auto" then
 			if vim.bo.filetype == "python" then
-				repl_send(CMDfg.run_cmd, "MPLBACKEND='module://kitty' ipython" .. "\r")
+				repl_send(REPL.run_cmd, "MPLBACKEND='module://kitty' ipython" .. "\r")
 			else
-				repl_send(CMDfg.run_cmd, "icpp" .. "\r")
+				repl_send(REPL.run_cmd, "icpp" .. "\r")
 			end
 		else
-			repl_send(CMDfg.run_cmd, jit_runner .. "\r")
+			repl_send(REPL.run_cmd, jit_runner .. "\r")
 		end
 	else
 		open_new_repl()
@@ -202,8 +198,8 @@ end
 
 function M.repl_run_again()
 	if the_command then
-		if CMDfg.runner_open == true then
-			repl_send(CMDfg.run_cmd, the_command)
+		if REPL.runner_open == true then
+			repl_send(REPL.run_cmd, the_command)
 		else
 			open_new_repl()
 		end
@@ -211,8 +207,8 @@ function M.repl_run_again()
 end
 
 function M.repl_send_and_run(arg_command)
-	if CMDfg.runner_open == true then
-		repl_send(CMDfg.run_cmd, arg_command .. "\r")
+	if REPL.runner_open == true then
+		repl_send(REPL.run_cmd, arg_command .. "\r")
 	else
 		open_new_repl()
 	end
@@ -223,23 +219,23 @@ function M.repl_prompt_and_run()
 	local command = fn.input("! ")
 	fn.inputrestore()
 	the_command = command .. "\r"
-	if CMDfg.runner_open == true then
-		repl_send(CMDfg.run_cmd, the_command)
+	if REPL.runner_open == true then
+		repl_send(REPL.run_cmd, the_command)
 	else
 		open_new_repl()
 	end
 end
 
 function M.repl_killer()
-	if CMDfg.runner_open == true then
-		repl_send(CMDfg.kill_cmd, nil)
+	if REPL.runner_open == true then
+		repl_send(REPL.kill_cmd, nil)
 	end
-	CMDfg.runner_open = false
+	REPL.runner_open = false
 end
 
 function M.repl_cleanup()
-	if CMDfg.runner_open == true then
-		repl_send(CMDfg.run_cmd, "")
+	if REPL.runner_open == true then
+		repl_send(REPL.run_cmd, "")
 	end
 end
 
@@ -266,39 +262,26 @@ local function define_keymaps()
 	nvim_set_keymap("n", "<leader>;w", ":KittyREPLStart<cr>", opts)
 end
 
-function M.setup(cfg_)
-	CMDfg = cfg_ or {}
+function M.setup(user_config)
+	REPL = user_config or {}
 
-	-- TODO: All concerning repl_id could be replaced wiht the window ID
-	--       in Kitty. This could be useful if we want to reuse an existing
-	--       window as repl.
-
-	-- get kitty largest window id
-
-	-- local wid = io.popen[[ kitty @ ls 2>/dev/null | grep \"id\" | tr '\"id\":' ' ' | tr ',' ' ' | tail -1 | sed 's/^ *//g' ]]
-	-- local uuid_handle = io.popen[[uuidgen|sed 's/.*/&/']]
-	-- local uuid = uuid_handle:read("*a")
-	-- uuid_handle:close()
-
-	-- set run and kill commands to runner_id
-	CMDfg.window_id = nil
-
-	-- set which kind of window will have the repl
-	-- it can be `attached` or `native`
-	CMDfg.window_kind = "attached"
+	-- store the window id of the kitty window used for the REPL
+	REPL.window_id = nil
+	-- store kind of window will have the repl it can be `attached` or `native`
+	REPL.window_kind = "attached"
+	-- we do not have any runner yet
+	REPL.runner_open = false
 
 	-- define keymaps
 	create_commands()
 
 	-- toggle keymaps
-	if CMDfg.use_keymaps ~= nil then
-		CMDfg.use_keymaps = CMDfg.use_keymaps
+	if REPL.use_keymaps ~= nil then
+		REPL.use_keymaps = REPL.use_keymaps
 	else
 		define_keymaps()
 	end
 
-	-- we do not have any runner yet
-	CMDfg.runner_open = false
 end
 
 -- Now let's ensure not REPL is open after we exit
