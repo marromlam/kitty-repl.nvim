@@ -72,7 +72,7 @@ local function open_new_repl()
                 },
             })
         else
-            print('Opening attached REPL')
+            -- print('Opening attached REPL')
             loop.spawn('kitty', {
                 args = {
                     '@',
@@ -252,6 +252,27 @@ end
 
 function M.repl_cleanup()
     if REPL.runner_open == true then repl_send(REPL.run_cmd, '') end
+end
+
+function M.repl_run_repl()
+    -- get all the lines in the current buffer
+    local lines = vim.api.nvim_buf_get_lines(0, 0, -1, true)
+    -- get all lines starting with '# repl:'
+    local repl_lines = {}
+    for _, line in ipairs(lines) do
+        if line:find('^# !') then
+            table.insert(repl_lines, string.sub(line, 4))
+        end
+    end
+    -- print the repl lines
+    if REPL.runner_open == true then
+        for _, line in ipairs(repl_lines) do
+            repl_send(REPL.run_cmd, line .. '\n')
+            os.execute('sleep ' .. tonumber(2))
+        end
+    else
+        open_new_repl()
+    end
 end
 
 local function create_commands()
