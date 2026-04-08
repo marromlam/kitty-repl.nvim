@@ -1,9 +1,12 @@
 local fn = vim.fn
 local cmd = vim.cmd
-local loop = vim.loop
+local loop = vim.uv or vim.loop
 local nvim_set_keymap = vim.api.nvim_set_keymap
 
 local M = {}
+
+local REPL = {}
+local LOGFILE
 
 -- local variable with the command that is going to be executed
 local the_command
@@ -27,7 +30,7 @@ end
 --- Lua misses a sleep function, so I made one using the shell
 --- sleep function. Be aware this function does not work on Windows
 --- @param n number of seconds to sleep
-local function sleep(n) os.execute('sleep ' .. tonumber(n)) end
+local function sleep(n) vim.uv.sleep(n * 1000) end
 
 -- Get largest id from all kitty windows
 -- If the ID window is empty (default) then this function is used to get the
@@ -47,7 +50,9 @@ local function get_largest_id(id)
         )
     end
 
+    if not foo then return tonumber(id) end
     local bar = foo:read('*a')
+    foo:close()
     return tonumber(id or bar)
 end
 
@@ -182,6 +187,14 @@ local function cook_command(region)
 end
 
 function M.repl_run(region)
+    if region == nil then
+        local r = vim.fn.getregionpos(vim.fn.getpos("'<"), vim.fn.getpos("'>"), { type = "l" })
+        if #r == 1 then
+            region = { 0 }
+        else
+            region = { r[1][1][2], r[#r][2][2] }
+        end
+    end
     the_command = cook_command(region)
     vim.cmd([[delm <>]]) -- delete visual selection marks
     if REPL.runner_open == true then
@@ -268,7 +281,7 @@ function M.repl_run_repl()
     if REPL.runner_open == true then
         for _, line in ipairs(repl_lines) do
             repl_send(REPL.run_cmd, line .. '\n')
-            os.execute('sleep ' .. tonumber(2))
+            vim.uv.sleep(2000)
         end
     else
         open_new_repl()
@@ -280,7 +293,7 @@ local function create_commands()
         [[command! KittyREPLRunAgain lua require('kitty-repl').repl_run_again()]]
     )
     cmd(
-        [[command! -range KittyREPLSend lua require('kitty-repl').repl_run(vim.region(0, vim.fn.getpos("'<"), vim.fn.getpos("'>"), "l", false)[0])]]
+        [[command! -range KittyREPLSend lua require('kitty-repl').repl_run()]]
     )
     cmd(
         [[command! KittyREPLRun lua require('kitty-repl').repl_prompt_and_run()]]
@@ -293,7 +306,7 @@ local function create_commands()
 end
 
 local function define_keymaps()
-    opts = { noremap = true, silent = true }
+    local opts = { noremap = true, silent = true }
     nvim_set_keymap('n', '<leader>;r', ':KittyREPLRun<cr>', opts)
     nvim_set_keymap('x', '<leader>;s', ':KittyREPLSend<cr>', opts)
     nvim_set_keymap('n', '<leader>;s', ':KittyREPLSend<cr>', opts)
@@ -307,14 +320,14 @@ local function define_keymaps()
 end
 
 function M.setup(user_config)
-    REPL = user_config or {}
+    REPL = user_config or {} ---@diagnostic disable-line: need-check-nil
 
     -- store the window id of the kitty window used for the REPL
     REPL.window_id = nil
     -- store kind of window will have the repl it can be `attached` or `native`
     REPL.window_kind = 'attached'
     REPL.debug = false
-    if REPL.debug == true then LOGFILE = io.open('test.log', 'a') end
+    if REPL.debug == true then LOGFILE = io.open('test.log', 'a') end ---@diagnostic disable-line: need-check-nil
     -- we do not have any runner yet
     REPL.runner_open = false
 
@@ -322,9 +335,7 @@ function M.setup(user_config)
     create_commands()
 
     -- toggle keymaps
-    if REPL.use_keymaps ~= nil then
-        REPL.use_keymaps = REPL.use_keymaps
-    else
+    if REPL.use_keymaps ~= false then
         define_keymaps()
     end
 end
