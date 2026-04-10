@@ -1,352 +1,474 @@
 local fn = vim.fn
-local cmd = vim.cmd
-local loop = vim.uv or vim.loop
-local nvim_set_keymap = vim.api.nvim_set_keymap
 
 local M = {}
 
-local REPL = {}
-local LOGFILE
-
--- local variable with the command that is going to be executed
+-- last executed command (for repl_run_again)
 local the_command
+-- active backend table
+local backend
+-- resolved backend name (set in setup)
+local backend_name
+-- user config
+local cfg = {}
 
--- this function is only to print lua dicts
--- I use it for debugging purposes
-local function dump(o)
-    if type(o) == 'table' then
-        local s = '{ '
-        for k, v in pairs(o) do
-            if type(k) ~= 'number' then k = '"' .. k .. '"' end
-            s = s .. '[' .. k .. '] = ' .. dump(v) .. ','
+-- Default cell delimiters per filetype
+local default_cell_delimiters = {
+    python     = '# %%',
+    lua        = '-- %%',
+    r          = '# %%',
+}
+
+-- Start command prefix per filetype (e.g. '#;' in python means '#; ipython')
+local default_start_prefixes = {
+    python     = '#;',
+    r          = '#;',
+    lua        = '--;',
+    cpp        = '//;',
+    c          = '//;',
+    javascript = '//;',
+    typescript = '//;',
+    julia      = '#;',
+    sh         = '#;',
+    bash       = '#;',
+}
+
+--- Return effective config, merging buffer-level overrides on top of global cfg.
+local function effective_cfg()
+    local buf_cfg = vim.b.kitty_repl_config
+    if type(buf_cfg) == 'table' then
+        local merged = {}
+        for k, v in pairs(cfg) do merged[k] = v end
+        for k, v in pairs(buf_cfg) do merged[k] = v end
+        return merged
+    end
+    return cfg
+end
+
+-- Built-in language escape functions (user-extensible via cfg.escape_fns)
+local escape_fns = {}
+
+escape_fns.python = function(text)
+    local cfg_local = effective_cfg() -- defined below, called at runtime only
+    local use_ipython = cfg_local.python_ipython ~= false  -- default true
+
+    local lines = vim.split(text, '\n', { plain = true })
+
+    -- strip leading/trailing blank lines
+    while #lines > 0 and lines[1]:match('^%s*$') do table.remove(lines, 1) end
+    while #lines > 0 and lines[#lines]:match('^%s*$') do table.remove(lines) end
+    if #lines == 0 then return '\n' end
+
+    if #lines > 1 and use_ipython then
+        -- IPython %cpaste protocol for multi-line
+        backend.send('%cpaste -q\n')
+        vim.uv.sleep(cfg_local.dispatch_ipython_pause or 100)
+        return table.concat(lines, '\n') .. '\n--\n'
+    end
+
+    -- Single line or standard Python: dedent, then add a trailing newline
+    -- after any indented block so Python doesn't wait for more input
+    local indent = lines[1]:match('^(%s*)')
+    local dedented = {}
+    for _, l in ipairs(lines) do
+        dedented[#dedented + 1] = l:sub(#indent + 1)
+    end
+
+    -- Insert extra newline after indented blocks (so `if/for/def` blocks execute)
+    local result = {}
+    for i, l in ipairs(dedented) do
+        result[#result + 1] = l
+        local next_l = dedented[i + 1]
+        if next_l and l:match('^%s') and not next_l:match('^%s') and
+           not next_l:match('^elif') and not next_l:match('^else') and
+           not next_l:match('^except') and not next_l:match('^finally') then
+            result[#result + 1] = ''
         end
-        return s .. '} '
+    end
+
+    return table.concat(result, '\n') .. '\n'
+end
+
+-- Apply filetype-specific escaping, falling back to appending \n
+local function escape_text(text)
+    local ft = vim.bo.filetype
+    local escape_fn = (cfg.escape_fns and cfg.escape_fns[ft]) or escape_fns[ft]
+    if escape_fn then return escape_fn(text) end
+    -- Default: ensure text ends with a single newline
+    return text:gsub('\n*$', '') .. '\n'
+end
+
+
+--- Open the backend pane, printing a notification first.
+local function open_backend()
+    vim.api.nvim_echo({ { 'kitty-repl: using backend ' .. backend_name .. ' to open a new pane', 'Normal' } }, false, {})
+    backend.open()
+end
+
+--- Send raw text to the REPL, applying escaping and bracketed paste.
+--- This is the single entry point for all text delivery.
+--- Also stores the result in `the_command` for repl_run_again.
+function M.send_text(text)
+    -- Check environment is sane before trying to open
+    if not backend.is_open() then
+        if backend.ValidEnv and not backend.ValidEnv() then return end
+        open_backend()
+        -- Wait for the pane/shell to be ready before sending
+        vim.uv.sleep(cfg.open_delay or 500)
+    end
+    local ecfg = effective_cfg()
+    local escaped = escape_text(text)
+    if ecfg.bracketed_paste then
+        escaped = '\27[200~' .. escaped .. '\27[201~'
+    end
+    backend.send(escaped)
+    the_command = escaped
+end
+
+--- Operator function: called by vim after the user completes a motion.
+--- @param type string 'char', 'line', or 'block'
+function M.send_op(type)
+    local saved = fn.getreg('"')
+    local saved_type = fn.getregtype('"')
+    if type == 'line' then
+        vim.cmd("silent '[,']yank")
+    elseif type == 'char' then
+        vim.cmd("silent normal! `[v`]y")
     else
-        return tostring(o)
+        -- block: fall back to line-wise for REPL purposes
+        vim.cmd("silent '[,']yank")
+    end
+    local text = fn.getreg('"')
+    fn.setreg('"', saved, saved_type)
+
+    local curpos
+    if cfg.preserve_curpos ~= false then
+        curpos = vim.api.nvim_win_get_cursor(0)
+    end
+
+    M.send_text(text)
+
+    if curpos then
+        vim.api.nvim_win_set_cursor(0, curpos)
     end
 end
 
---- Sleep function
---- Lua misses a sleep function, so I made one using the shell
---- sleep function. Be aware this function does not work on Windows
---- @param n number of seconds to sleep
-local function sleep(n) vim.uv.sleep(n * 1000) end
-
--- Get largest id from all kitty windows
--- If the ID window is empty (default) then this function is used to get the
--- largest id from all kitty windows which should correspond with the kitty
--- window we just created.
--- @param id number identifying the kitty window, if this number is provided
--- then the function will return it
-local function get_largest_id(id)
-    local foo = nil
-    if os.getenv('SSH_TTY') then
-        foo = io.popen(
-            [[ kitty @ --to=tcp:localhost:$KITTY_PORT ls | grep \"id\" | tr "\"id\":" " " | tr "," " " | tail -1 | sed 's/^ *//g' ]]
-        )
-    else
-        foo = io.popen(
-            [[ kitty @ --to=$KITTY_LISTEN_ON ls | grep \"id\" | tr "\"id\":" " " | tr "," " " | tail -1 | sed 's/^ *//g' ]]
-        )
-    end
-
-    if not foo then return tonumber(id) end
-    local bar = foo:read('*a')
-    foo:close()
-    return tonumber(id or bar)
+--- Set operatorfunc and return 'g@' to trigger operator mode.
+--- Intended for use with `expr` keymap option.
+function M.send_operator()
+    vim.o.operatorfunc = "v:lua.require'kitty-repl'.send_op"
+    return 'g@'
 end
 
--- Get largest id from all kitty windows (wrapper for get_largest_id function)
--- If the ID window is empty (default) then this function is used to get the
--- largest id from all kitty windows which should correspond with the kitty
--- window we just created.
--- @param id number identifying the kitty window, if this number is provided
--- then the function will return it
-function M.get_id(id) return get_largest_id(id) end
+--- Send N lines from the current cursor position (default: 1) and advance cursor.
+--- @param count number
+function M.send_lines(count)
+    count = count or 1
+    local row = vim.api.nvim_win_get_cursor(0)[1]
+    local lines = vim.api.nvim_buf_get_lines(0, row - 1, row - 1 + count, false)
+    M.send_text(table.concat(lines, '\n'))
+    -- Advance cursor by count lines (stops at last line)
+    local total = vim.api.nvim_buf_line_count(0)
+    local next_row = math.min(row + count, total)
+    vim.api.nvim_win_set_cursor(0, { next_row, 0 })
+end
 
--- open runner
-local function open_new_repl()
-    if REPL.window_kind == 'attached' then
-        if os.getenv('SSH_TTY') then
-            loop.spawn('kitty', {
-                args = {
-                    '@',
-                    '--to=tcp:localhost:' .. os.getenv('KITTY_PORT'),
-                    'launch',
-                    '--title=REPL',
-                },
-            })
-        else
-            -- print('Opening attached REPL')
-            loop.spawn('kitty', {
-                args = {
-                    '@',
-                    '--to=' .. os.getenv('KITTY_LISTEN_ON'),
-                    'launch',
-                    '--title=REPL',
-                },
-            })
+--- Send the current cell (block between cell delimiter lines).
+function M.send_cell()
+    local delimiter = cfg.cell_delimiter
+        or default_cell_delimiters[vim.bo.filetype]
+        or '# %%'
+    local cur = vim.api.nvim_win_get_cursor(0)[1]
+    local lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
+
+    -- scan backward for the start of this cell
+    local start_line = 1
+    for i = cur - 1, 1, -1 do
+        if lines[i]:find(vim.pesc(delimiter), 1, true) then
+            start_line = i + 1
+            break
         end
-    else
-        loop.spawn('kitty', { args = { '@', 'launch', '--title=REPL' } })
     end
 
-    sleep(0.1)
-    -- let's hope nobody creates a new kitty window before we get to it
-    local window_id = get_largest_id(REPL.window_id)
-    -- now we are ready to set the basic info for the repl
-    REPL.run_cmd = { 'send-text', '--match=id:' .. window_id }
-    REPL.kill_cmd = { 'close-window', '--match=id:' .. window_id }
-    if os.getenv('SSH_TTY') then
-        REPL.run_cmd = {
-            '--to=tcp:localhost:' .. os.getenv('KITTY_PORT'),
-            'send-text',
-            '--match=id:' .. window_id,
-        }
-        REPL.kill_cmd = {
-            '--to=tcp:localhost:' .. os.getenv('KITTY_PORT'),
-            'close-window',
-            '--match=id:' .. window_id,
-        }
+    -- scan forward for the end of this cell
+    local end_line = #lines
+    for i = cur, #lines do
+        if lines[i]:find(vim.pesc(delimiter), 1, true) then
+            end_line = i - 1
+            break
+        end
     end
-    REPL.runner_open = true
+
+    local cell_lines = vim.api.nvim_buf_get_lines(0, start_line - 1, end_line, false)
+    M.send_text(table.concat(cell_lines, '\n') .. '\n')
 end
 
-local function repl_send(cmd_args, command)
-    local args = { '@' }
-    for _, v in pairs(cmd_args) do
-        table.insert(args, v)
-    end
-    table.insert(args, command)
-    loop.spawn('kitty', { args = args })
-end
-
-local function cook_command_python(region)
-    local lines
-    local command
-    local last_line
-    if region[1] == 0 then
-        -- we only have selected one line here
-        lines = vim.api.nvim_buf_get_lines(
-            0,
-            vim.api.nvim_win_get_cursor(0)[1] - 1,
-            vim.api.nvim_win_get_cursor(0)[1],
-            true
-        )
-        command = table.concat(lines, '\r') .. '\r'
-    else
-        -- we have several lines selected here
-        lines = vim.api.nvim_buf_get_lines(0, region[1] - 1, region[2], true)
-        --[[ last_line = lines[#lines - 0] -- lets get last_line and see if is indented or not
-    -- print(dump(lines))
-    -- print(last_line)
-    if last_line:find("  ", 1, true) == 1 then
-      -- this is an indented line, hence we add another CR in order to just run the line
-      command = table.concat(lines, '\r') .. '\r\r'
-    else
-      command = table.concat(lines, '\n') .. '\r'
-    end ]]
-
-        -- lets use cpaste for now
-        repl_send(REPL.run_cmd, '%cpaste -q\r')
-        sleep(0.1)
-        command = table.concat(lines, '\r') .. '\r--\r'
-    end
-    return command
-end
-
-local function cook_command_cpp(region)
-    local lines
-    local command
-    local last_line
-    if region[1] == 0 then
-        -- we only have selected one line here
-        lines = vim.api.nvim_buf_get_lines(
-            0,
-            vim.api.nvim_win_get_cursor(0)[1] - 1,
-            vim.api.nvim_win_get_cursor(0)[1],
-            true
-        )
-        command = table.concat(lines, '\r') .. '\r'
-    else
-        -- we have several lines selected here
-        lines = vim.api.nvim_buf_get_lines(0, region[1] - 1, region[2], true)
-        command = table.concat(lines, '\r') .. '\r'
-    end
-    return command
-end
-
-local function cook_command(region)
-    local command
-    if vim.bo.filetype == 'python' then
-        command = cook_command_python(region)
-    else
-        command = cook_command_cpp(region)
-    end
-    return command
-end
-
+--- Send selected/current-line region (used by KittyREPLSend command).
+--- @param region table|nil {0} for single line, {start, end} for multi-line
 function M.repl_run(region)
+    if not backend.is_open() then
+        M.repl_start('auto')
+        return
+    end
     if region == nil then
-        local r = vim.fn.getregionpos(vim.fn.getpos("'<"), vim.fn.getpos("'>"), { type = "l" })
-        if #r == 1 then
+        local start_pos = vim.fn.getpos("'<")
+        local end_pos   = vim.fn.getpos("'>")
+        if start_pos[2] == 0 or end_pos[2] == 0 then
+            -- no prior visual selection — send current line
             region = { 0 }
         else
-            region = { r[1][1][2], r[#r][2][2] }
+            local r = vim.fn.getregionpos(start_pos, end_pos, { type = "V" })
+            if #r <= 1 then
+                region = { 0 }
+            else
+                region = { r[1][1][2], r[#r][2][2] }
+            end
         end
     end
-    the_command = cook_command(region)
-    vim.cmd([[delm <>]]) -- delete visual selection marks
-    if REPL.runner_open == true then
-        repl_send(REPL.run_cmd, the_command)
+
+    local lines
+    if region[1] == 0 then
+        lines = vim.api.nvim_buf_get_lines(
+            0,
+            vim.api.nvim_win_get_cursor(0)[1] - 1,
+            vim.api.nvim_win_get_cursor(0)[1],
+            true
+        )
     else
-        open_new_repl()
+        lines = vim.api.nvim_buf_get_lines(0, region[1] - 1, region[2], true)
     end
+
+    vim.cmd([[delm <>]]) -- delete visual selection marks
+    M.send_text(table.concat(lines, '\n'))
 end
 
 function M.repl_select(id)
-    REPL.window_id = id or REPL.window_id
-    print('You have selected the following kitty window ID:', REPL.window_id)
+    if backend_name == 'kitty' then
+        require('kitty-repl.backends.kitty').set_window_id(id)
+    else
+        vim.api.nvim_echo({ { 'kitty-repl: repl_select is only supported for the kitty backend', 'WarningMsg' } }, false, {})
+    end
 end
 
 function M.repl_start(jit_runner)
-    if REPL.runner_open == true then
-        if jit_runner == 'auto' then
-            if vim.bo.filetype == 'python' then
-                repl_send(
-                    REPL.run_cmd,
-                    "MPLBACKEND='module://kitty' ipython" .. '\r'
-                )
-            else
-                repl_send(REPL.run_cmd, 'icpp' .. '\r')
+    if backend.is_open() then
+        vim.api.nvim_echo({ { 'kitty-repl: REPL already open', 'WarningMsg' } }, false, {})
+        return
+    end
+    if backend.ValidEnv and not backend.ValidEnv() then return end
+    open_backend()
+    if not backend.is_open() then return end  -- open() failed
+    if jit_runner == 'auto' then
+        local ft = vim.bo.filetype
+        local start_prefix = (cfg.start_prefixes and cfg.start_prefixes[ft])
+            or default_start_prefixes[ft]
+        local start_cmd
+        if start_prefix then
+            local pattern = '^' .. vim.pesc(start_prefix) .. '%s*(.+)'
+            for _, line in ipairs(vim.api.nvim_buf_get_lines(0, 0, -1, false)) do
+                local cmd = line:match(pattern)
+                if cmd then
+                    start_cmd = cmd
+                    break
+                end
             end
-        else
-            repl_send(REPL.run_cmd, jit_runner .. '\r')
         end
-    else
-        open_new_repl()
+        if ft == 'python' then
+            local mpl_prefix = (backend_name == 'kitty' or backend_name == 'tmux')
+                and "MPLBACKEND='module://kitty' "
+                or ''
+            backend.send(mpl_prefix .. (start_cmd or 'ipython') .. '\n')
+        elseif start_cmd then
+            backend.send(start_cmd .. '\n')
+        end
+        -- other filetypes: just open the pane, don't assume an interpreter
+    elseif jit_runner then
+        backend.send(jit_runner .. '\n')
     end
 end
 
 function M.repl_run_again()
     if the_command then
-        if REPL.runner_open == true then
-            repl_send(REPL.run_cmd, the_command)
-        else
-            open_new_repl()
-        end
+        if not backend.is_open() then open_backend() end
+        backend.send(the_command)
     end
 end
 
 function M.repl_send_and_run(arg_command)
-    if REPL.runner_open == true then
-        repl_send(REPL.run_cmd, arg_command .. '\r')
-    else
-        open_new_repl()
-    end
+    if not backend.is_open() then open_backend() end
+    backend.send(arg_command .. '\r')
 end
 
 function M.repl_prompt_and_run()
     fn.inputsave()
     local command = fn.input('! ')
     fn.inputrestore()
-    the_command = command .. '\r'
-    if REPL.runner_open == true then
-        repl_send(REPL.run_cmd, the_command)
-    else
-        open_new_repl()
+    M.send_text(command)
+end
+
+--- Send text raw (no escaping, no \r appended). Used by :KittyREPLSend0.
+function M.backend_send_raw(text)
+    if not backend.is_open() then
+        if backend.ValidEnv and not backend.ValidEnv() then return end
+        open_backend()
     end
+    backend.send(text)
 end
 
 function M.repl_killer()
-    if REPL.runner_open == true then repl_send(REPL.kill_cmd, nil) end
-    REPL.runner_open = false
+    if backend.is_open() then
+        backend.kill()
+        vim.api.nvim_echo({ { 'kitty-repl: REPL closed', 'Normal' } }, false, {})
+    end
 end
 
 function M.repl_cleanup()
-    if REPL.runner_open == true then repl_send(REPL.run_cmd, '') end
+    -- Ctrl-C to interrupt + Ctrl-U to clear the line
+    if backend.is_open() then
+        backend.send('\x03')
+        backend.send('\x15')
+    end
 end
 
 function M.repl_run_repl()
-    -- get all the lines in the current buffer
+    local ft = vim.bo.filetype
+    local prefix = (cfg.start_prefixes and cfg.start_prefixes[ft])
+        or default_start_prefixes[ft]
+        or '#;'
+    local pattern = '^' .. vim.pesc(prefix) .. '%s*(.*)'
     local lines = vim.api.nvim_buf_get_lines(0, 0, -1, true)
-    -- get all lines starting with '# repl:'
     local repl_lines = {}
     for _, line in ipairs(lines) do
-        if line:find('^# !') then
-            table.insert(repl_lines, string.sub(line, 4))
+        local cmd = line:match(pattern)
+        if cmd then
+            table.insert(repl_lines, cmd)
         end
     end
-    -- print the repl lines
-    if REPL.runner_open == true then
-        for _, line in ipairs(repl_lines) do
-            repl_send(REPL.run_cmd, line .. '\n')
-            vim.uv.sleep(2000)
-        end
-    else
-        open_new_repl()
+    if not backend.is_open() then
+        if backend.ValidEnv and not backend.ValidEnv() then return end
+        open_backend()
+        vim.uv.sleep(cfg.open_delay or 500)
+        if not backend.is_open() then return end
+    end
+    local delay_ms = (cfg.repl_run_delay or 2) * 1000
+    for _, line in ipairs(repl_lines) do
+        backend.send(line .. '\n')
+        vim.uv.sleep(delay_ms)
     end
 end
 
 local function create_commands()
-    cmd(
-        [[command! KittyREPLRunAgain lua require('kitty-repl').repl_run_again()]]
-    )
-    cmd(
-        [[command! -range KittyREPLSend lua require('kitty-repl').repl_run()]]
-    )
-    cmd(
-        [[command! KittyREPLRun lua require('kitty-repl').repl_prompt_and_run()]]
-    )
-    cmd([[command! KittyREPLClear lua require('kitty-repl').repl_cleanup()]])
-    cmd([[command! KittyREPLKill lua require('kitty-repl').repl_killer()]])
-    cmd(
-        [[command! KittyREPLStart lua require('kitty-repl').repl_start("auto")]]
-    )
+    local c = vim.api.nvim_create_user_command
+    c('KittyREPLRunAgain',  function() M.repl_run_again() end,       { force = true, desc = 'Re-send last command' })
+    c('KittyREPLSend',      function(o)
+        if o.range > 0 then
+            M.repl_run({ o.line1, o.line2 })
+        else
+            M.repl_run()
+        end
+    end, { force = true, range = true, desc = 'Send selection/line to REPL' })
+    c('KittyREPLSendLine',  function(o) M.send_lines(o.count) end,   { force = true, count = 1,    desc = 'Send N lines to REPL' })
+    c('KittyREPLSendCell',  function() M.send_cell() end,            { force = true, desc = 'Send current cell to REPL' })
+    c('KittyREPLSendRepl',  function() M.repl_run_repl() end,        { force = true, desc = 'Run all # ! lines in buffer' })
+    c('KittyREPLRun',       function() M.repl_prompt_and_run() end,  { force = true, desc = 'Prompt and send to REPL' })
+    c('KittyREPLClear',     function() M.repl_cleanup() end,         { force = true, desc = 'Clear REPL' })
+    c('KittyREPLKill',      function() M.repl_killer() end,          { force = true, desc = 'Kill REPL' })
+    c('KittyREPLStart',     function() M.repl_start('auto') end,     { force = true, desc = 'Start REPL interpreter' })
+    c('KittyREPLSend1', function(o) M.repl_send_and_run(o.args) end, { force = true, nargs = 1, desc = 'Send text to REPL with Enter' })
+    c('KittyREPLSend0', function(o) M.backend_send_raw(o.args) end,  { force = true, nargs = 1, desc = 'Send raw text to REPL' })
 end
 
 local function define_keymaps()
-    local opts = { noremap = true, silent = true }
-    nvim_set_keymap('n', '<leader>;r', ':KittyREPLRun<cr>', opts)
-    nvim_set_keymap('x', '<leader>;s', ':KittyREPLSend<cr>', opts)
-    nvim_set_keymap('n', '<leader>;s', ':KittyREPLSend<cr>', opts)
-    nvim_set_keymap('x', '<S-CR>', ':KittyREPLSend<cr><cr>', opts)
-    nvim_set_keymap('n', '<S-CR>', ':KittyREPLSend<cr><cr>', opts)
-    nvim_set_keymap('n', '<leader>;c', ':KittyREPLClear<cr>', opts)
-    nvim_set_keymap('n', '<leader>;k', ':KittyREPLKill<cr>', opts)
-    nvim_set_keymap('n', '<leader>;l', ':KittyREPLRunAgain<cr>', opts)
-    -- trigger these automatically on extension
-    nvim_set_keymap('n', '<leader>;w', ':KittyREPLStart<cr>', opts)
+    local map = vim.keymap.set
+    local o   = { noremap = true, silent = true }
+    local ox  = { noremap = true, silent = true, expr = true }
+
+    -- <Plug> mappings (always registered, safe to remap)
+    map('n', '<Plug>(KittyREPLSend)',          M.send_operator,              { expr = true, desc = 'Send motion to REPL' })
+    map('n', '<Plug>(KittyREPLSendLine)',      '<cmd>KittyREPLSendLine<cr>', { desc = 'Send current line to REPL' })
+    map('x', '<Plug>(KittyREPLSendVisual)',    ':<C-u>KittyREPLSend<cr>',   { noremap = true, silent = true, desc = 'Send selection to REPL' })
+    map('n', '<Plug>(KittyREPLSendCell)',      '<cmd>KittyREPLSendCell<cr>', { desc = 'Send current cell to REPL' })
+    map('n', '<Plug>(KittyREPLSendParagraph)', function()
+        vim.o.operatorfunc = "v:lua.require'kitty-repl'.send_op"
+        return 'g@ip'
+    end, { expr = true, desc = 'Send paragraph to REPL' })
+
+    -- Default keymaps (skip if already mapped by user)
+    local function nmap(lhs, rhs, desc)
+        if vim.fn.mapcheck(lhs, 'n') == '' then
+            map('n', lhs, rhs, vim.tbl_extend('force', o, { desc = desc }))
+        end
+    end
+    local function xmap(lhs, rhs, desc)
+        if vim.fn.mapcheck(lhs, 'x') == '' then
+            -- Use :<C-u> instead of <cmd> so '< '> marks are set before the command runs
+            map('x', lhs, rhs, vim.tbl_extend('force', o, { desc = desc }))
+        end
+    end
+
+    -- Motion-based send: <leader>s{motion}
+    if vim.fn.mapcheck('<leader>s', 'n') == '' then
+        map('n', '<leader>s',  M.send_operator, vim.tbl_extend('force', ox, { desc = 'Send motion to REPL' }))
+    end
+    nmap('<leader>ss', '<cmd>KittyREPLSendLine<cr>',              'Send current line to REPL')
+    nmap('<leader>sp', '<Plug>(KittyREPLSendParagraph)',          'Send current paragraph to REPL')
+    xmap('<leader>s',  ':<C-u>KittyREPLSend<cr>',                'Send selection to REPL')
+    nmap('<leader>sc', '<cmd>KittyREPLSendCell<cr>',             'Send current cell to REPL')
+
+    -- Legacy keymaps
+    nmap('<leader>;r', '<cmd>KittyREPLRun<cr>',       'REPL: prompt and run')
+    xmap('<leader>;s', ':<C-u>KittyREPLSend<cr>',     'REPL: send selection')
+    nmap('<leader>;s', '<cmd>KittyREPLSend<cr>',      'REPL: send line')
+    xmap('<S-CR>', ':<C-u>KittyREPLSend<cr>', 'REPL: start or send selection')
+    nmap('<S-CR>', '<cmd>KittyREPLSend<cr>',  'REPL: start or send line')
+    nmap('<leader>;c', '<cmd>KittyREPLClear<cr>',     'REPL: clear')
+    nmap('<leader>;k', '<cmd>KittyREPLKill<cr>',      'REPL: kill')
+    nmap('<leader>;l', '<cmd>KittyREPLRunAgain<cr>',  'REPL: run again')
+    nmap('<leader>;w', '<cmd>KittyREPLStart<cr>',     'REPL: start interpreter')
 end
+
+--- Returns true if the REPL is currently open. Useful for statuslines.
+function M.is_open()
+    return backend ~= nil and backend.is_open()
+end
+
 
 function M.setup(user_config)
-    REPL = user_config or {} ---@diagnostic disable-line: need-check-nil
+    -- Kill any existing REPL before replacing the backend
+    if backend and backend.is_open() then
+        backend.kill()
+    end
 
-    -- store the window id of the kitty window used for the REPL
-    REPL.window_id = nil
-    -- store kind of window will have the repl it can be `attached` or `native`
-    REPL.window_kind = 'attached'
-    REPL.debug = false
-    if REPL.debug == true then LOGFILE = io.open('test.log', 'a') end ---@diagnostic disable-line: need-check-nil
-    -- we do not have any runner yet
-    REPL.runner_open = false
+    cfg = user_config or {}
+    cfg.window_kind = cfg.window_kind or 'attached'
 
-    -- define keymaps
+    -- Merge user escape_fns on top of built-ins
+    if cfg.escape_fns then
+        for ft, fn_override in pairs(cfg.escape_fns) do
+            escape_fns[ft] = fn_override
+        end
+    end
+
+    local function default_backend()
+        if os.getenv('TMUX') then return 'tmux' end
+        return 'kitty'
+    end
+    backend_name = cfg.backend or default_backend()
+    backend = require('kitty-repl.backends.' .. backend_name)
+    backend.init(cfg)
+
     create_commands()
 
-    -- toggle keymaps
-    if REPL.use_keymaps ~= false then
+    if cfg.use_keymaps ~= false then
         define_keymaps()
     end
-end
 
--- Now let's ensure not REPL is open after we exit
-vim.cmd([[
-augroup KittyREPL
-  autocmd!
-  autocmd FileType * autocmd BufDelete <buffer> KittyREPLKill
-  autocmd QuitPre *  KittyREPLKill
-augroup end
-]])
+    -- Register QuitPre cleanup inside setup so backend is always available
+    vim.api.nvim_create_autocmd('QuitPre', {
+        group = vim.api.nvim_create_augroup('KittyREPL', { clear = true }),
+        callback = function()
+            if backend and backend.is_open() then backend.kill() end
+        end,
+    })
+end
 
 return M
