@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find /usr/local/share/nvim -name *.md -o -name builtin.txt)",
+      "Bash(awk:*)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:api.github.com)",
+      "Bash(curl -s https://raw.githubusercontent.com/jpalardy/vim-slime/main/autoload/slime.vim)",
+      "Bash(curl:*)",
+      "Bash(for f:*)",
+      "Read(//Users/marcos/Workspaces/personal/kitty-repl.nvim/**)",
+      "Bash(done)",
+      "Bash(nvim:*)",
+      "WebFetch(domain:neovim.io)"
+    ]
+  }
+}
